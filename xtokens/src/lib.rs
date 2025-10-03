@@ -54,13 +54,17 @@ use xcm_executor::traits::WeightBounds;
 
 pub use module::*;
 use orml_traits::{
-	location::{Parse, Reserve},
+	location::Reserve,
 	xcm_transfer::{Transferred, XtokensWeightInfo},
 	GetByKey, XcmTransfer,
 };
 
+use codec::DecodeWithMemTracking;
+
 mod mock;
 mod tests;
+
+pub const ASSET_HUB_ID: u32 = 1_000;
 
 enum TransferKind {
 	/// Transfer self reserve asset.
@@ -71,6 +75,29 @@ enum TransferKind {
 	ToNonReserve,
 }
 use TransferKind::*;
+
+#[derive(
+	scale_info::TypeInfo,
+	Default,
+	Encode,
+	Decode,
+	Clone,
+	Copy,
+	Eq,
+	PartialEq,
+	Debug,
+	MaxEncodedLen,
+	DecodeWithMemTracking,
+)]
+pub enum MigrationPhase {
+	/// Not started
+	#[default]
+	NotStarted,
+	/// Started
+	InProgress,
+	/// Completed
+	Completed,
+}
 
 #[frame_support::pallet]
 pub mod module {
@@ -131,7 +158,13 @@ pub mod module {
 		/// The way to retreave the reserve of a MultiAsset. This can be
 		/// configured to accept absolute or relative paths for self tokens
 		type ReserveProvider: Reserve;
+
+		/// The origin that can change the migration phase
+		type MigrationPhaseUpdateOrigin: EnsureOrigin<Self::RuntimeOrigin>;
 	}
+
+	#[pallet::storage]
+	pub type MigrationStatus<T: Config> = StorageValue<_, MigrationPhase, ValueQuery>;
 
 	#[pallet::event]
 	#[pallet::generate_deposit(fn deposit_event)]
@@ -143,6 +176,8 @@ pub mod module {
 			fee: MultiAsset,
 			dest: MultiLocation,
 		},
+		/// The AH migration phase has changed
+		MigrationPhaseChanged { migration_phase: MigrationPhase },
 	}
 
 	#[pallet::error]
@@ -388,6 +423,21 @@ pub mod module {
 
 			Self::do_transfer_multiassets(who, assets.clone(), fee.clone(), dest, dest_weight_limit).map(|_| ())
 		}
+
+		/// Must be called by `[T::MigrationPhaseUpdateOrigin]`.
+		/// Changes the AH migration status, which will have impact on how
+		/// reserves are computed from this pallet extrinsics.
+		#[pallet::call_index(6)]
+		#[pallet::weight(frame_support::weights::Weight::from_parts(10000, 0))]
+		pub fn set_migration_phase(origin: OriginFor<T>, migration_phase: MigrationPhase) -> DispatchResult {
+			T::MigrationPhaseUpdateOrigin::ensure_origin(origin)?;
+
+			MigrationStatus::<T>::set(migration_phase);
+
+			Self::deposit_event(Event::<T>::MigrationPhaseChanged { migration_phase });
+
+			Ok(())
+		}
 	}
 
 	impl<T: Config> Pallet<T> {
@@ -548,7 +598,7 @@ pub mod module {
 			if fee_reserve != non_fee_reserve {
 				// Current only support `ToReserve` with relay-chain asset as fee. other case
 				// like `NonReserve` or `SelfReserve` with relay-chain fee is not support.
-				ensure!(non_fee_reserve == dest.chain_part(), Error::<T>::InvalidAsset);
+				ensure!(non_fee_reserve == Self::chain_part(&dest), Error::<T>::InvalidAsset);
 
 				let reserve_location = non_fee_reserve.ok_or(Error::<T>::AssetHasNoReserve)?;
 				let min_xcm_fee = T::MinXcmFee::get(&reserve_location).ok_or(Error::<T>::MinXcmFeeNotDefined)?;
@@ -573,7 +623,7 @@ pub mod module {
 
 				let mut override_recipient = T::SelfLocation::get();
 				if override_recipient == MultiLocation::here() {
-					let dest_chain_part = dest.chain_part().ok_or(Error::<T>::InvalidDest)?;
+					let dest_chain_part = Self::chain_part(&dest).ok_or(Error::<T>::InvalidDest)?;
 					let ancestry = T::UniversalLocation::get();
 					let _ = override_recipient
 						.reanchor(&dest_chain_part, ancestry)
@@ -798,7 +848,7 @@ pub mod module {
 
 		/// Ensure has the `dest` has chain part and recipient part.
 		fn ensure_valid_dest(dest: &MultiLocation) -> Result<(MultiLocation, MultiLocation), DispatchError> {
-			if let (Some(dest), Some(recipient)) = (dest.chain_part(), dest.non_chain_part()) {
+			if let (Some(dest), Some(recipient)) = (Self::chain_part(&dest), Self::non_chain_part(&dest)) {
 				Ok((dest, recipient))
 			} else {
 				Err(Error::<T>::InvalidDest.into())
@@ -843,6 +893,41 @@ pub mod module {
 			};
 			let asset = assets.get(reserve_idx);
 			asset.and_then(T::ReserveProvider::reserve)
+		}
+
+		/// Returns the "chain" location part. It could be parent, sibling
+		/// parachain, or child parachain.
+		pub fn chain_part(location: &MultiLocation) -> Option<MultiLocation> {
+			match (location.parents, location.first_interior()) {
+				// sibling parachain
+				(1, Some(Parachain(id))) => Some(MultiLocation::new(1, Parachain(*id))),
+				// parent
+				(1, _) => match MigrationStatus::<T>::get() {
+					// RelayChain
+					MigrationPhase::NotStarted => Some(MultiLocation::parent()),
+					// Disable transfer when migration is in progress
+					MigrationPhase::InProgress => None,
+					// AssetHub
+					MigrationPhase::Completed => Some(MultiLocation::new(1, Parachain(ASSET_HUB_ID))),
+				},
+				// children parachain
+				(0, Some(Parachain(id))) => Some(MultiLocation::new(0, Parachain(*id))),
+				_ => None,
+			}
+		}
+
+		/// Returns "non-chain" location part.
+		pub fn non_chain_part(location: &MultiLocation) -> Option<MultiLocation> {
+			let mut junctions = location.interior().clone();
+			while is_chain_junction(junctions.first()) {
+				let _ = junctions.take_first();
+			}
+
+			if junctions != Here {
+				Some(MultiLocation::new(0, junctions))
+			} else {
+				None
+			}
 		}
 	}
 
@@ -1037,5 +1122,42 @@ fn subtract_fee(asset: &MultiAsset, amount: u128) -> MultiAsset {
 	MultiAsset {
 		fun: Fungible(final_amount),
 		id: asset.id,
+	}
+}
+
+fn is_chain_junction(junction: Option<&Junction>) -> bool {
+	matches!(junction, Some(Parachain(_)))
+}
+
+// Provide reserve in absolute path view
+pub struct AbsoluteReserveProviderMigrationPhase<T>(PhantomData<T>);
+
+impl<T: Config> Reserve for AbsoluteReserveProviderMigrationPhase<T> {
+	fn reserve(asset: &MultiAsset) -> Option<MultiLocation> {
+		let location = if let AssetId::Concrete(location) = &asset.id {
+			location
+		} else {
+			return None;
+		};
+		Pallet::<T>::chain_part(location)
+	}
+}
+
+// Provide reserve in relative path view
+// Self tokens are represeneted as Here
+pub struct RelativeReserveProviderMigrationPhase<T>(PhantomData<T>);
+
+impl<T: Config> Reserve for RelativeReserveProviderMigrationPhase<T> {
+	fn reserve(asset: &MultiAsset) -> Option<MultiLocation> {
+		let location = if let AssetId::Concrete(location) = &asset.id {
+			location
+		} else {
+			return None;
+		};
+		if location.parents == 0 && !is_chain_junction(location.first_interior()) {
+			Some(MultiLocation::here())
+		} else {
+			Pallet::<T>::chain_part(location)
+		}
 	}
 }

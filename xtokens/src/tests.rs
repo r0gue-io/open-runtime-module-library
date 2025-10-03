@@ -3,9 +3,13 @@
 use super::*;
 use codec::Encode;
 use cumulus_primitives_core::ParaId;
-use frame_support::{assert_err, assert_noop, assert_ok, traits::Currency};
+use frame_support::{
+	assert_err, assert_noop, assert_ok,
+	traits::{ContainsPair, Currency},
+};
 use mock::*;
 use orml_traits::{ConcreteFungibleAsset, MultiCurrency};
+use orml_xcm_support::MultiNativeAsset;
 use polkadot_parachain::primitives::Sibling;
 use sp_runtime::{traits::AccountIdConversion, AccountId32};
 use xcm::{v3::OriginKind::SovereignAccount, VersionedXcm};
@@ -1719,5 +1723,308 @@ fn send_with_insufficient_weight_limit() {
 	ParaB::execute_with(|| {
 		// no funds should arrive - message will have failed
 		assert_eq!(ParaTokens::free_balance(CurrencyId::A, &BOB), 0);
+	});
+}
+
+#[test]
+fn set_migration_phase_should_work() {
+	TestNet::reset();
+
+	ParaA::execute_with(|| {
+		assert_eq!(MigrationPhase::NotStarted, MigrationStatus::<para::Runtime>::get());
+		assert_ok!(ParaXTokens::set_migration_phase(
+			para::RuntimeOrigin::root(),
+			MigrationPhase::InProgress
+		));
+		assert!(para::System::events().iter().any(|r| {
+			matches!(
+				r.event,
+				para::RuntimeEvent::XTokens(Event::MigrationPhaseChanged {
+					migration_phase: MigrationPhase::InProgress
+				})
+			)
+		}));
+
+		assert_eq!(MigrationPhase::InProgress, MigrationStatus::<para::Runtime>::get());
+		assert_ok!(ParaXTokens::set_migration_phase(
+			para::RuntimeOrigin::root(),
+			MigrationPhase::Completed
+		));
+		assert_eq!(MigrationPhase::Completed, MigrationStatus::<para::Runtime>::get());
+	});
+}
+
+// AbsoluteReserveProviderMigrationPhase and
+// RelativeReserveProviderMigrationPhase
+const PARACHAIN: Junction = Parachain(1);
+const GENERAL_INDEX: Junction = GeneralIndex(1);
+const ASSET_HUB: Junction = Parachain(ASSET_HUB_ID);
+
+fn concrete_fungible(id: MultiLocation) -> MultiAsset {
+	(id, 1).into()
+}
+
+#[test]
+fn reserve_for_parent_assets() {
+	TestNet::reset();
+
+	ParaA::execute_with(|| {
+		// Before Migration is executed => Parent is the reserve
+		assert_eq!(
+			AbsoluteReserveProviderMigrationPhase::<para::Runtime>::reserve(&concrete_fungible(MultiLocation::new(
+				1,
+				GENERAL_INDEX
+			))),
+			Some(MultiLocation::parent())
+		);
+		assert_eq!(
+			RelativeReserveProviderMigrationPhase::<para::Runtime>::reserve(&concrete_fungible(MultiLocation::new(
+				1,
+				GENERAL_INDEX
+			))),
+			Some(MultiLocation::parent())
+		);
+
+		// During the migration, reserve computation is disabled
+		assert_ok!(ParaXTokens::set_migration_phase(
+			para::RuntimeOrigin::root(),
+			MigrationPhase::InProgress
+		));
+
+		assert_eq!(
+			AbsoluteReserveProviderMigrationPhase::<para::Runtime>::reserve(&concrete_fungible(MultiLocation::new(
+				1,
+				GENERAL_INDEX
+			))),
+			None
+		);
+		assert_eq!(
+			RelativeReserveProviderMigrationPhase::<para::Runtime>::reserve(&concrete_fungible(MultiLocation::new(
+				1,
+				GENERAL_INDEX
+			))),
+			None
+		);
+
+		// After the migration, AH is the reserve
+		assert_ok!(ParaXTokens::set_migration_phase(
+			para::RuntimeOrigin::root(),
+			MigrationPhase::Completed
+		));
+		assert_eq!(
+			AbsoluteReserveProviderMigrationPhase::<para::Runtime>::reserve(&concrete_fungible(MultiLocation::new(
+				1,
+				GENERAL_INDEX
+			))),
+			Some(MultiLocation::new(1, ASSET_HUB))
+		);
+		assert_eq!(
+			RelativeReserveProviderMigrationPhase::<para::Runtime>::reserve(&concrete_fungible(MultiLocation::new(
+				1,
+				GENERAL_INDEX
+			))),
+			Some(MultiLocation::new(1, ASSET_HUB))
+		);
+	});
+}
+
+#[test]
+fn reserve_for_sibling_parachain_assets() {
+	TestNet::reset();
+
+	ParaA::execute_with(|| {
+		// Before the migration => The sibling parachain is the reserve
+		assert_eq!(
+			AbsoluteReserveProviderMigrationPhase::<para::Runtime>::reserve(&concrete_fungible(MultiLocation::new(
+				1,
+				(PARACHAIN, GENERAL_INDEX)
+			))),
+			Some(MultiLocation::new(1, PARACHAIN))
+		);
+		assert_eq!(
+			RelativeReserveProviderMigrationPhase::<para::Runtime>::reserve(&concrete_fungible(MultiLocation::new(
+				1,
+				(PARACHAIN, GENERAL_INDEX)
+			))),
+			Some(MultiLocation::new(1, PARACHAIN))
+		);
+		// During the migration, reserve's still the sibling
+		assert_ok!(ParaXTokens::set_migration_phase(
+			para::RuntimeOrigin::root(),
+			MigrationPhase::InProgress
+		));
+
+		assert_eq!(
+			AbsoluteReserveProviderMigrationPhase::<para::Runtime>::reserve(&concrete_fungible(MultiLocation::new(
+				1,
+				(PARACHAIN, GENERAL_INDEX)
+			))),
+			Some(MultiLocation::new(1, PARACHAIN))
+		);
+		assert_eq!(
+			RelativeReserveProviderMigrationPhase::<para::Runtime>::reserve(&concrete_fungible(MultiLocation::new(
+				1,
+				(PARACHAIN, GENERAL_INDEX)
+			))),
+			Some(MultiLocation::new(1, PARACHAIN))
+		);
+
+		// After the migration, reserve's still the sibling
+		assert_ok!(ParaXTokens::set_migration_phase(
+			para::RuntimeOrigin::root(),
+			MigrationPhase::Completed
+		));
+		assert_eq!(
+			AbsoluteReserveProviderMigrationPhase::<para::Runtime>::reserve(&concrete_fungible(MultiLocation::new(
+				1,
+				(PARACHAIN, GENERAL_INDEX)
+			))),
+			Some(MultiLocation::new(1, PARACHAIN))
+		);
+		assert_eq!(
+			RelativeReserveProviderMigrationPhase::<para::Runtime>::reserve(&concrete_fungible(MultiLocation::new(
+				1,
+				(PARACHAIN, GENERAL_INDEX)
+			))),
+			Some(MultiLocation::new(1, PARACHAIN))
+		);
+	});
+}
+
+#[test]
+fn reserve_for_child_parachain_assets() {
+	TestNet::reset();
+
+	ParaA::execute_with(|| {
+		// Before the migration => The sibling parachain is the reserve
+		assert_eq!(
+			AbsoluteReserveProviderMigrationPhase::<para::Runtime>::reserve(&concrete_fungible(MultiLocation::new(
+				0,
+				(PARACHAIN, GENERAL_INDEX)
+			))),
+			Some(PARACHAIN.into())
+		);
+		assert_eq!(
+			RelativeReserveProviderMigrationPhase::<para::Runtime>::reserve(&concrete_fungible(MultiLocation::new(
+				0,
+				(PARACHAIN, GENERAL_INDEX)
+			))),
+			Some(PARACHAIN.into())
+		);
+		// During the migration, reserve's still the sibling
+		assert_ok!(ParaXTokens::set_migration_phase(
+			para::RuntimeOrigin::root(),
+			MigrationPhase::InProgress
+		));
+
+		assert_eq!(
+			AbsoluteReserveProviderMigrationPhase::<para::Runtime>::reserve(&concrete_fungible(MultiLocation::new(
+				0,
+				(PARACHAIN, GENERAL_INDEX)
+			))),
+			Some(PARACHAIN.into())
+		);
+		assert_eq!(
+			RelativeReserveProviderMigrationPhase::<para::Runtime>::reserve(&concrete_fungible(MultiLocation::new(
+				0,
+				(PARACHAIN, GENERAL_INDEX)
+			))),
+			Some(PARACHAIN.into())
+		);
+
+		// After the migration, reserve's still the sibling
+		assert_ok!(ParaXTokens::set_migration_phase(
+			para::RuntimeOrigin::root(),
+			MigrationPhase::Completed
+		));
+		assert_eq!(
+			AbsoluteReserveProviderMigrationPhase::<para::Runtime>::reserve(&concrete_fungible(MultiLocation::new(
+				0,
+				(PARACHAIN, GENERAL_INDEX)
+			))),
+			Some(PARACHAIN.into())
+		);
+		assert_eq!(
+			RelativeReserveProviderMigrationPhase::<para::Runtime>::reserve(&concrete_fungible(MultiLocation::new(
+				0,
+				(PARACHAIN, GENERAL_INDEX)
+			))),
+			Some(PARACHAIN.into())
+		);
+	});
+}
+
+#[test]
+fn no_reserve_chain_for_absolute_self_for_relative() {
+	TestNet::reset();
+
+	ParaA::execute_with(|| {
+		assert_eq!(
+			AbsoluteReserveProviderMigrationPhase::<para::Runtime>::reserve(&concrete_fungible(MultiLocation::new(
+				0,
+				Junction::from(BoundedVec::try_from(b"DOT".to_vec()).unwrap())
+			))),
+			None
+		);
+		assert_eq!(
+			RelativeReserveProviderMigrationPhase::<para::Runtime>::reserve(&concrete_fungible(MultiLocation::new(
+				0,
+				Junction::from(BoundedVec::try_from(b"DOT".to_vec()).unwrap())
+			))),
+			Some(MultiLocation::here())
+		);
+	});
+}
+
+#[test]
+fn non_chain_part_works() {
+	assert_eq!(ParaXTokens::non_chain_part(&MultiLocation::parent()), None);
+	assert_eq!(ParaXTokens::non_chain_part(&MultiLocation::new(1, PARACHAIN)), None);
+	assert_eq!(ParaXTokens::non_chain_part(&MultiLocation::new(0, PARACHAIN)), None);
+
+	assert_eq!(
+		ParaXTokens::non_chain_part(&MultiLocation::new(1, GENERAL_INDEX)),
+		Some(GENERAL_INDEX.into())
+	);
+	assert_eq!(
+		ParaXTokens::non_chain_part(&MultiLocation::new(1, (GENERAL_INDEX, GENERAL_INDEX))),
+		Some((GENERAL_INDEX, GENERAL_INDEX).into())
+	);
+	assert_eq!(
+		ParaXTokens::non_chain_part(&MultiLocation::new(1, (PARACHAIN, GENERAL_INDEX))),
+		Some(GENERAL_INDEX.into())
+	);
+	assert_eq!(
+		ParaXTokens::non_chain_part(&MultiLocation::new(0, (PARACHAIN, GENERAL_INDEX))),
+		Some(GENERAL_INDEX.into())
+	);
+}
+
+#[test]
+fn multi_native_asset() {
+	TestNet::reset();
+
+	ParaA::execute_with(|| {
+		assert!(
+			MultiNativeAsset::<AbsoluteReserveProviderMigrationPhase<para::Runtime>>::contains(
+				&MultiAsset {
+					fun: Fungible(10),
+					id: AssetId::Concrete(MultiLocation::parent())
+				},
+				&Parent.into()
+			)
+		);
+		assert!(
+			MultiNativeAsset::<AbsoluteReserveProviderMigrationPhase<para::Runtime>>::contains(
+				&MultiAsset::sibling_parachain_asset(1, b"TokenA".to_vec().try_into().unwrap(), 100),
+				&MultiLocation::new(1, Parachain(1)),
+			)
+		);
+		assert!(
+			!MultiNativeAsset::<AbsoluteReserveProviderMigrationPhase<para::Runtime>>::contains(
+				&MultiAsset::sibling_parachain_asset(1, b"TokenA".to_vec().try_into().unwrap(), 100),
+				&MultiLocation::parent(),
+			)
+		);
 	});
 }
