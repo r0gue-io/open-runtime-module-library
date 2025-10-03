@@ -59,8 +59,6 @@ use orml_traits::{
 	GetByKey, XcmTransfer,
 };
 
-use codec::DecodeWithMemTracking;
-
 mod mock;
 mod tests;
 
@@ -87,7 +85,6 @@ use TransferKind::*;
 	PartialEq,
 	Debug,
 	MaxEncodedLen,
-	DecodeWithMemTracking,
 )]
 pub enum MigrationPhase {
 	/// Not started
